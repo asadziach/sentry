@@ -1,0 +1,285 @@
+import RPi.GPIO as GPIO
+import argparse
+import time
+import sys
+import numpy as np
+import cv2
+import os
+import time
+#from PIL import Image
+from time import sleep
+from notify_run import Notify 
+import multiprocessing as mp
+try:
+    from tflite_runtime.interpreter import Interpreter
+except:
+    import tensorflow as tf
+
+# Please update the following
+CAMERA_IP = '0.0.0.0'
+CAMERA_USER = ''
+CAMERA_PASSWORD = ''
+
+RTSP_URL = 'rtsp://' + CAMERA_USER +':' + CAMERA_PASSWORD + '@' + CAMERA_IP + ':554/cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif'
+ 
+os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;udp'
+
+lastresults = None
+processes = []
+frameBuffer = None
+results = None
+fps = ""
+detectfps = ""
+framecount = 0
+detectframecount = 0
+time1 = 0
+time2 = 0
+box_color = (38,0,255)
+box_thickness = 1
+label_background_color = (38,0,255)
+label_text_color = (255, 255, 255)
+percentage = 0.0
+lastDetectionTime = 0
+lastNotificationTime = 0
+minimumLightDurtation = 5
+minimumNotificationDelay = 15
+notify = Notify()
+# Pin Definitons:
+relay1Pin = 22 # P1 pin 15
+relay2Pin = 27 # P1 pin 13
+relay3Pin = 17 # P1 pin 11
+relay4Pin = 4 # P1 pin 7
+
+LABELS = [
+'???','person','bicycle','car','motorcycle','airplane','bus','train','truck','boat',
+'traffic light','fire hydrant','???','stop sign','parking meter','bench','bird','cat','dog','horse',
+'sheep','cow','elephant','bear','zebra','giraffe','???','backpack','umbrella','???',
+'???','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball','kite','baseball bat',
+'baseball glove','skateboard','surfboard','tennis racket','bottle','???','wine glass','cup','fork','knife',
+'spoon','bowl','banana','apple','sandwich','orange','broccoli','carrot','hot dog','pizza',
+'donut','cake','chair','couch','potted plant','bed','???','dining table','???','???',
+'toilet','???','tv','laptop','mouse','remote','keyboard','cell phone','microwave','oven',
+'toaster','sink','refrigerator','???','book','clock','vase','scissors','teddy bear','hair drier',
+'toothbrush']
+
+
+class ObjectDetectorLite():
+    def __init__(self, model_path='detect.tflite', num_threads=12):
+        try:
+            self.interpreter = Interpreter(model_path=model_path, num_threads=num_threads)
+        except:
+            self.interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=num_threads)
+        try:
+            self.interpreter.allocate_tensors()
+        except:
+            pass
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+
+    def _boxes_coordinates(self,
+                            image,
+                            boxes,
+                            classes,
+                            scores,
+                            max_boxes_to_draw=20,
+                            min_score_thresh=.5):
+
+        if not max_boxes_to_draw:
+            max_boxes_to_draw = boxes.shape[0]
+        number_boxes = min(max_boxes_to_draw, boxes.shape[0])
+        person_boxes = []
+        for i in range(number_boxes):
+            if scores is None or scores[i] > min_score_thresh:
+                box = tuple(boxes[i].tolist())
+                ymin, xmin, ymax, xmax = box
+                _, im_height, im_width, _ = image.shape
+                left, right, top, bottom = [int(z) for z in (xmin * im_width, xmax * im_width, ymin * im_height, ymax * im_height)]
+                person_boxes.append([(left, top), (right, bottom), scores[i], LABELS[classes[i]]])
+        return person_boxes
+
+
+    def detect(self, image, threshold=0.1):
+
+        # run model
+        self.interpreter.set_tensor(self.input_details[0]['index'], image)
+        start_time = time.time()
+        self.interpreter.invoke()
+        stop_time = time.time()
+        #print("time: ", stop_time - start_time)
+
+        # get results
+        boxes = self.interpreter.get_tensor(self.output_details[0]['index'])
+        classes = self.interpreter.get_tensor(self.output_details[1]['index'])
+        scores = self.interpreter.get_tensor(self.output_details[2]['index'])
+        num = self.interpreter.get_tensor(self.output_details[3]['index'])
+
+        # Find detected boxes coordinates
+        return self._boxes_coordinates(image,
+                            np.squeeze(boxes[0]),
+                            np.squeeze(classes[0]+1).astype(np.int32),
+                            np.squeeze(scores[0]),
+                            min_score_thresh=threshold)
+
+
+def overlay_on_image(frames, object_infos, camera_width, camera_height):
+    global lastDetectionTime
+    color_image = frames
+
+    if isinstance(object_infos, type(None)):
+        return color_image
+    img_cp = color_image.copy()
+
+    for obj in object_infos:
+        box_left = int(obj[0][0])
+        box_top = int(obj[0][1])
+        box_right = int(obj[1][0])
+        box_bottom = int(obj[1][1])
+        cv2.rectangle(img_cp, (box_left, box_top), (box_right, box_bottom), box_color, box_thickness)
+
+        if obj[3] == 'person':
+            percentage = int(obj[2] * 100)
+            label_text = obj[3] + " (" + str(percentage) + "%)" 
+
+            label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            label_left = box_left
+            label_top = box_top - label_size[1]
+            if (label_top < 1):
+                label_top = 1
+            label_right = label_left + label_size[0]
+            label_bottom = label_top + label_size[1]
+            cv2.rectangle(img_cp, (label_left - 1, label_top - 1), (label_right + 1, label_bottom + 1), label_background_color, -1)
+            cv2.putText(img_cp, label_text, (label_left, label_bottom), cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_text_color, 1)
+            lastDetectionTime = time.perf_counter()
+
+    return img_cp
+
+def init_gpio():
+    GPIO.setmode(GPIO.BCM) # Broadcom pin-numbering scheme
+
+    # relay pin set as output
+    GPIO.setup(relay1Pin, GPIO.OUT) 
+    GPIO.setup(relay2Pin, GPIO.OUT)
+    GPIO.setup(relay3Pin, GPIO.OUT) 
+    GPIO.setup(relay4Pin, GPIO.OUT) 
+
+    # Initial state for relay:
+    GPIO.output(relay1Pin, GPIO.LOW)
+    GPIO.output(relay2Pin, GPIO.LOW)
+    GPIO.output(relay3Pin, GPIO.HIGH)
+    GPIO.output(relay4Pin, GPIO.LOW)
+
+def light_on():
+    GPIO.output(relay3Pin, GPIO.LOW)
+
+def light_off():
+    GPIO.output(relay3Pin, GPIO.HIGH)
+
+def push_notificaiton():
+    global lastNotificationTime
+    currentTime = time.perf_counter()
+    timeSinceLastNotification = currentTime - lastNotificationTime
+    if timeSinceLastNotification > minimumNotificationDelay:
+        notify.send('Unauthorized Person Detected!') 
+        lastNotificationTime = currentTime
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="models/mobilenet_ssd_v2_coco_quant_postprocess.tflite", help="Path of the detection model.")
+    parser.add_argument("--usbcamno", type=int, default=0, help="USB Camera number.")
+    parser.add_argument("--camera_type", default="ip_cam", help="set usb_cam or raspi_cam")
+    parser.add_argument("--camera_width", type=int, default=640, help="width.")
+    parser.add_argument("--camera_height", type=int, default=480, help="height.")
+    parser.add_argument("--vidfps", type=int, default=150, help="Frame rate.")
+    parser.add_argument("--num_threads", type=int, default=4, help="Threads.")
+    args = parser.parse_args()
+
+    model         = args.model
+    usbcamno      = args.usbcamno
+    camera_type   = args.camera_type
+    camera_width  = args.camera_width
+    camera_height = args.camera_height
+    vidfps        = args.vidfps
+    num_threads   = args.num_threads
+
+    if camera_type == "usb_cam":
+        cam = cv2.VideoCapture(usbcamno)
+        cam.set(cv2.CAP_PROP_FPS, vidfps)
+        cam.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width)
+        cam.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_height)
+        window_name = "USB Camera"
+    elif camera_type == "raspi_cam":
+        from picamera.array import PiRGBArray
+        from picamera import PiCamera
+        cam = PiCamera()
+        cam.resolution = (camera_width, camera_height)
+        stream = PiRGBArray(cam)
+        window_name = "Raspi Camera"
+    elif camera_type == "ip_cam":
+        cam = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+        window_name = "IP Camera"
+    else:
+        print('[Error] --camera_type: wrong device')
+        parser.print_help()
+        sys.exit()
+    print(window_name)
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+
+    detector = ObjectDetectorLite(model, num_threads)
+
+    init_gpio()
+    
+    while True:
+        t1 = time.perf_counter()
+
+        if camera_type == 'raspi_cam':
+            cam.capture(stream, 'bgr', use_video_port=True)
+            color_image = stream.array
+            stream.truncate(0)
+        else:
+            ret, color_image = cam.read()
+            if not ret:
+              continue
+
+        prepimg = cv2.resize(color_image, (300, 300))
+        frames = prepimg.copy()
+        prepimg = prepimg[:, :, ::-1].copy()
+        prepimg = np.expand_dims(prepimg, axis=0)
+        prepimg = prepimg.astype('uint8')
+        res = detector.detect(prepimg, 0.4)
+
+        imdraw = overlay_on_image(frames, res, camera_width, camera_height)
+        imdraw = cv2.resize(imdraw, (camera_width, camera_height))
+        cv2.imshow(window_name, imdraw)
+
+        # Relay PowerOn calculation
+        currentTime = time.perf_counter()
+        timeSinceLastDetection = currentTime - lastDetectionTime
+        if timeSinceLastDetection < minimumLightDurtation:
+            # GPIO ON
+            print("ON")
+            light_on()
+            push_notificaiton()
+        else:
+            # GPIO OFF
+            print("OFF")
+            light_off()
+
+
+        if cv2.waitKey(1)&0xFF == ord('q'):
+            break
+
+        # FPS calculation
+        framecount += 1
+        if framecount >= 15:
+            fps       = "(Playback) {:.1f} FPS".format(time1/15)
+            framecount = 0
+            detectframecount = 0
+            time1 = 0
+            time2 = 0
+        t2 = time.perf_counter()
+        elapsedTime = t2-t1
+        time1 += 1/elapsedTime
+        time2 += elapsedTime
+
